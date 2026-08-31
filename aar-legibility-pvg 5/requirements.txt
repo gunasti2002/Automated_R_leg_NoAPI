@@ -1,0 +1,15 @@
+# Core
+jinja2>=3.1
+
+# Qwen-only mode (use_finetunable_prover=True, the current default): both
+# the prover and verifier are local HF models. No anthropic/API dependency
+# needed while this mode is active.
+transformers>=4.44
+torch>=2.2
+peft>=0.11
+accelerate>=0.30
+
+# Uncomment only if you switch config.py back to use_finetunable_prover=False
+# (frozen Claude-prover mode) and wire generate_helpful_finding /
+# generate_sneaky_finding to real API calls:
+# anthropic>=0.40
