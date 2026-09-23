@@ -2,98 +2,154 @@
 Central configuration for the AAR legibility PVG pipeline.
 Single source of truth — all modules import from here.
 """
-from dataclasses import dataclass, field
-from typing import Optional
+import json
+import os
+from dataclasses import dataclass, field, fields
+from typing import Optional, Tuple
 
 
 @dataclass
 class PVGConfig:
     # --- Models ---
     # Two modes, chosen by use_finetunable_prover below:
-    #   False (default): prover_model is a frozen API model (e.g. Claude) —
-    #       matches the real, live AAR. No prover fine-tuning happens; only
-    #       the verifier trains (see LIMITATIONS.md #5). Use this if the
-    #       claim you want is "we can gate the real AAR's submissions."
-    #   True: prover_model is a LOCAL, fine-tunable stand-in model (e.g.
-    #       Qwen2.5-7B-Instruct) trained via GRPO against the verifier's
-    #       score, mirroring Kirchner et al.'s actual method. Use this if
-    #       the claim you want is "PVG training makes a researcher-like
-    #       model's findings more legible" — NOTE this is then a claim
-    #       about the stand-in model, not about the real Claude-based AAR
-    #       (see LIMITATIONS.md #7).
-    # Set to True (Qwen-only mode): prover is a LOCAL, LoRA-fine-tunable
-    # stand-in model, trained via GRPO in train_prover_step.py. No Claude
-    # API calls happen anywhere in pvg_loop.py in this mode.
+    #   False: prover_model is a frozen API model (e.g. Claude). Only the
+    #       verifier trains (see LIMITATIONS.md #5). Out of scope for now —
+    #       no paid API is available.
+    #   True: prover_model is a LOCAL, LoRA-fine-tunable stand-in model
+    #       trained via GRPO against the verifier's score, mirroring
+    #       Kirchner et al.'s actual method (see LIMITATIONS.md #7).
     use_finetunable_prover: bool = True
-    # Small model so a free-tier Colab T4 (16GB) can hold prover + ref copy
-    # + verifier at once. Bump to 3B/7B once this runs end-to-end cleanly.
+    # Small model so a free-tier Colab T4 (16GB) can hold both prover
+    # adapters + the verifier at once.
     prover_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
 
     # The verifier should be small relative to the prover, per the paper's
-    # design (a weak verifier that must be genuinely convinced, not a
-    # same-capability model that can be talked into agreeing with itself).
+    # design. Same base here; the verifier gets its own LoRA adapter.
     verifier_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
 
-    # --- Fine-tunable prover settings (only used if use_finetunable_prover=True) ---
+    # --- Fine-tunable prover settings ---
     prover_lora_r: int = 16
     prover_lora_alpha: int = 16
-    prover_lr: float = 1e-5
+    prover_lr: float = 2e-5
     prover_num_generations: int = 4       # samples per experiment, per role, per round
-                                           # (GRPO-style group for advantage normalization)
-    prover_max_new_tokens: int = 512
+    # Findings are ~60-120 tokens; 512 was mostly wasted generation time.
+    prover_max_new_tokens: int = 200
     prover_temperature: float = 0.9
     prover_kl_penalty: float = 0.02       # penalize drifting too far from the base model
+    # Wrap prover prompts in the model's chat template (Instruct models
+    # complete raw text instead of following it — the same bug class that
+    # broke the verifier).
+    prover_use_chat_template: bool = True
+    # GRPO advantage: (r - mean) / std amplifies tiny reward noise into O(1)
+    # advantages when a whole group scores nearly the same (which is common
+    # with a continuous P(sound) reward). Default is the Dr.GRPO-style
+    # unnormalized advantage (r - mean); set True for the classic form.
+    grpo_normalize_std: bool = False
+    # "convincingness": reward = verifier P(sound) for both roles (the
+    #     signal the smoke test and rounds 1-4 used).
+    # "correctness_gated": Kirchner et al.'s CGC — reward = P(sound) only when
+    #     the completion is role-aligned per the rule check (helpful must pass
+    #     it, sneaky must fail it), else 0. Opt-in; see the PR notes.
+    prover_reward_mode: str = "convincingness"
 
     # --- PVG training loop ---
-    num_rounds: int = 20                 # outer alternation rounds
-    findings_per_round: int = 64         # (experiment, prover) pairs sampled per round
+    num_rounds: int = 10                 # outer alternation rounds
+    # (experiment) records sampled per round. Each yields
+    # prover_num_generations completions per role, all of which feed the
+    # verifier. 8 records -> 64 completions/round; 64 records would be ~50
+    # min/round on a T4.
+    findings_per_round: int = 8
     verifier_train_epochs_per_round: int = 1
-    verifier_lr: float = 1e-5
+    # LoRA, so 1e-4 (a full-fine-tune 1e-5 barely moves an adapter).
+    verifier_lr: float = 1e-4
     verifier_batch_size: int = 16
+    verifier_lora_r: int = 16
+    verifier_lora_alpha: int = 16
+    # Before round 1 the verifier does N epochs on the TRAIN split of the
+    # labeled dataset, so round-1 provers see a non-degenerate reward.
+    verifier_warmup_epochs: int = 2
+    verifier_warmup_max_epochs: int = 6   # extra epochs allowed while the 20-item gate bar is unmet
+    # The verifier trains each round on a sliding window of recent prover
+    # samples plus the labeled dataset. Capped for memory/time.
+    verifier_replay_max: int = 600
+    # Include the labeled TRAIN split in every verifier update (not just
+    # the prover-sample replay window). Turn off only for plumbing tests.
+    verifier_train_on_dataset: bool = True
 
     # --- Data construction ---
-    # Source of real experiment records (metrics + config + an honest
-    # write-up) to build training pairs from. Point this at wherever your
-    # AAR's actual findings/results are stored (e.g. the automated-w2s-research
-    # server's /api/findings/all, or a local export of shared_findings/).
     source_findings_dir: str = "data/source_findings"
     output_dataset_path: str = "data/findings_pvg_dataset.jsonl"
+    heldout_dataset_path: str = "data/findings_pvg_heldout.jsonl"
+    spot_check_set_path: str = "data/spot_check_set.jsonl"
+    dataset_target_pairs: int = 120       # honest/sneaky pairs before the split
+    heldout_fraction: float = 0.2         # split is BY RECORD so pairs stay together
+    dataset_seed: int = 42
 
     # Minimum internal-consistency checks a "helpful" finding must pass to be
     # used as ground-truth-honest training data (see data/schema.py).
     require_cited_metrics_match: bool = True
     require_num_seeds_disclosed: bool = True
 
-    # --- Sneaky prover generation ---
-    # Only used by data/build_findings_dataset.py's generate_sneaky_counterpart,
-    # which is now a local heuristic corruption (no API calls) — see that
-    # file. This field is unused while that's the case; left here in case
-    # you swap in a real model-based generator later.
-    sneaky_generator_model: str = "claude-sonnet-4-6"
-    sneaky_generation_temperature: float = 0.9
+    # --- Gates and abort criteria (training refuses to run / stops itself) ---
+    # Step-2 gate: the two fixed spot-check cases must get DIFFERENT
+    # verdicts and both must be parseable, every time a training process
+    # starts. At round 1 (untrained verifier) the 20-item hand-checked set
+    # must also clear these bars.
+    gate_min_spot_accuracy: float = 0.70
+    gate_accept_rate_range: Tuple[float, float] = (0.3, 0.7)
+    # Step-3 abort: after each round's verifier update, on the held-out
+    # balanced set.
+    abort_if_heldout_accept_rate_above: float = 0.9
+    abort_if_reward_gap_at_or_below: float = 0.0
 
     # --- Evaluation ---
-    human_eval_batch_size: int = 40      # findings shown per human reviewer session
-    human_eval_time_limit_seconds: int = 120  # "time-constrained" per the paper's design
+    human_eval_batch_size: int = 40
+    human_eval_time_limit_seconds: int = 120
     human_eval_output_dir: str = "eval/human_eval_sessions"
 
     # --- Integration with the live AAR loop ---
-    # Verifier acceptance threshold below which a share_finding submission is
-    # rejected outright (see integration/share_finding_gate.py). This is a
-    # judgment call, not derived from theory — start conservative (low bar,
-    # catch only clear misrepresentation) and tighten based on round-over-round
-    # verifier robustness once you trust it.
     gate_reject_threshold: float = 0.3
+    # Where run_one_round.py leaves the trained verifier adapter (per seed).
+    trained_verifier_dir: str = "training/checkpoint/seed_42/verifier"
 
     seed: int = 42
+
+    def __post_init__(self):
+        # Optional JSON overrides for quick experiments / smoke tests without
+        # editing this file, e.g.
+        #   PVG_CONFIG_OVERRIDES='{"findings_per_round": 2, "num_rounds": 1}'
+        raw = os.environ.get("PVG_CONFIG_OVERRIDES")
+        if raw:
+            known = {f.name for f in fields(self)}
+            for k, v in json.loads(raw).items():
+                if k not in known:
+                    raise KeyError(f"PVG_CONFIG_OVERRIDES: unknown field {k!r}")
+                setattr(self, k, tuple(v) if isinstance(v, list) else v)
 
 
 @dataclass
 class RunMetadata:
     """Attached to every PVG training round's output for later analysis."""
     round_number: int
+    seed: Optional[int] = None
     helpful_prover_accuracy: Optional[float] = None
     verifier_robustness: Optional[float] = None
+    # --- diagnostics added after the degenerate-verifier incident ---
+    unparseable_share: Optional[float] = None   # scoring calls with no usable verdict / all calls
+    heldout_accept_rate: Optional[float] = None  # P(sound)>=0.5 rate on the held-out balanced set
+    heldout_accuracy: Optional[float] = None
+    heldout_auroc: Optional[float] = None
+    reward_gap: Optional[float] = None           # mean helpful P(sound) - mean sneaky P(sound)
+    helpful_mean_reward: Optional[float] = None
+    sneaky_mean_reward: Optional[float] = None
+    role_fidelity_helpful: Optional[float] = None  # helpful completions passing the rule check
+    role_fidelity_sneaky: Optional[float] = None   # sneaky completions failing the rule check
+    spot_check_accuracy: Optional[float] = None    # 20-item hand-checked set
+    spot_check_accept_rate: Optional[float] = None
+    verifier_train_examples: Optional[int] = None
+    verifier_train_loss: Optional[float] = None
+    aborted: bool = False
+    elapsed_s: Optional[float] = None
     human_eval_helpful_accuracy: Optional[float] = None
     human_eval_sneaky_accuracy: Optional[float] = None
     notes: str = ""
