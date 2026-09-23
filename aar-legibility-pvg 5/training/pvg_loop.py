@@ -249,10 +249,15 @@ def verifier_answer_logprobs(v: dict, prompt_text: str) -> Tuple[torch.Tensor, t
     keep = max_c + 1
     try:
         logits = model(input_ids=input_ids, attention_mask=attn, logits_to_keep=keep).logits
-        offset = L - keep
     except TypeError:  # older transformers without logits_to_keep
         logits = model(input_ids=input_ids, attention_mask=attn).logits
+    # Never assume the kwarg was honoured: derive the offset from what came back.
+    if logits.shape[1] == L:
         offset = 0
+    elif logits.shape[1] == keep:
+        offset = L - keep
+    else:
+        raise RuntimeError(f"unexpected logits length {logits.shape[1]} for L={L}, keep={keep}")
 
     out = []
     for i, c in enumerate(cands):
