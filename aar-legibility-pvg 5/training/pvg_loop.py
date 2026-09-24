@@ -102,7 +102,7 @@ def _answer_token_ids(tokenizer) -> Dict[str, List[int]]:
 
 
 def register_verifier(verifier_model: str, model, tokenizer, device: str,
-                      cfg: Optional[PVGConfig] = None, optimizer=None) -> dict:
+                      cfg: Optional[PVGConfig] = None, optimizer=None, logit_bias: float = 0.0) -> dict:
     cfg = cfg or PVGConfig()
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -111,6 +111,9 @@ def register_verifier(verifier_model: str, model, tokenizer, device: str,
     _VERIFIER_CACHE[verifier_model] = {
         "model": model, "tokenizer": tokenizer, "device": device,
         "optimizer": optimizer, "answer_ids": _answer_token_ids(tokenizer),
+        # Scalar added to logp(SOUND) - logp(UNSOUND) before the sigmoid; set by
+        # calibrate_verifier_bias() on the train split, saved with the checkpoint.
+        "logit_bias": float(logit_bias),
     }
     return _VERIFIER_CACHE[verifier_model]
 
@@ -129,7 +132,7 @@ def _get_verifier(verifier_model: str, cfg: Optional[PVGConfig] = None) -> dict:
         # AdamW would need momentum + variance buffers for all ~1.5B params on
         # top of the two prover adapters already resident on a 16GB GPU.
         lora_cfg = LoraConfig(r=cfg.verifier_lora_r, lora_alpha=cfg.verifier_lora_alpha,
-                              target_modules=["q_proj", "v_proj"], lora_dropout=0.0)
+                              target_modules=list(cfg.verifier_lora_targets), lora_dropout=0.0)
         model = get_peft_model(base, lora_cfg)
         model.eval()
         register_verifier(verifier_model, model, tokenizer, device, cfg)
@@ -147,7 +150,9 @@ def load_verifier_checkpoint(cfg: PVGConfig, path: Path) -> dict:
     base = AutoModelForCausalLM.from_pretrained(cfg.verifier_model, dtype=pick_dtype(device)).to(device)
     model = PeftModel.from_pretrained(base, str(path), is_trainable=True)
     model.eval()
-    entry = register_verifier(cfg.verifier_model, model, tokenizer, device, cfg)
+    calib_path = Path(path) / "calibration.json"
+    bias = json.loads(calib_path.read_text()).get("logit_bias", 0.0) if calib_path.exists() else 0.0
+    entry = register_verifier(cfg.verifier_model, model, tokenizer, device, cfg, logit_bias=bias)
     opt_path = Path(path) / "optimizer.pt"
     if opt_path.exists():
         entry["optimizer"].load_state_dict(torch.load(opt_path, map_location=device))
@@ -160,6 +165,7 @@ def save_verifier_checkpoint(cfg: PVGConfig, path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     v["model"].save_pretrained(str(path))
     torch.save(v["optimizer"].state_dict(), path / "optimizer.pt")
+    (path / "calibration.json").write_text(json.dumps({"logit_bias": v.get("logit_bias", 0.0)}))
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +276,16 @@ def verifier_answer_logprobs(v: dict, prompt_text: str) -> Tuple[torch.Tensor, t
     return out[0], out[1]
 
 
+def verifier_logit(v: dict, prompt_text: str, apply_bias: bool = True) -> torch.Tensor:
+    """The scored quantity: logp(SOUND) - logp(UNSOUND) (+ calibration bias).
+    Used identically by scoring and by the training loss."""
+    lp_s, lp_u = verifier_answer_logprobs(v, prompt_text)
+    logit = (lp_s - lp_u).float()
+    if apply_bias:
+        logit = logit + float(v.get("logit_bias", 0.0))
+    return logit
+
+
 def score_p_sound(summary: str, metrics: dict, config: dict,
                   verifier_model: Optional[str] = None, cfg: Optional[PVGConfig] = None) -> Optional[float]:
     """
@@ -284,10 +300,10 @@ def score_p_sound(summary: str, metrics: dict, config: dict,
     was_training = v["model"].training
     v["model"].eval()
     with torch.no_grad():
-        lp_s, lp_u = verifier_answer_logprobs(v, prompt)
+        logit = verifier_logit(v, prompt)
     if was_training:
         v["model"].train()
-    d = (lp_s - lp_u).item()
+    d = logit.item()
     _SCORING_STATS["calls"] += 1
     if not math.isfinite(d):
         _SCORING_STATS["unparseable"] += 1
@@ -449,10 +465,55 @@ def add_to_replay(examples: List[dict], cfg: PVGConfig) -> None:
 def _verifier_example_loss(v: dict, ex: dict) -> torch.Tensor:
     record = ex["record"]
     prompt = _render_verifier_prompt(ex["summary"], record.get("metrics", {}), record.get("config", {}), v["tokenizer"])
-    lp_s, lp_u = verifier_answer_logprobs(v, prompt)
-    logit = (lp_s - lp_u).float().unsqueeze(0)
+    logit = verifier_logit(v, prompt).unsqueeze(0)
     target = torch.tensor([1.0 if ex["label"] == ANSWER_SOUND else 0.0], device=logit.device)
     return F.binary_cross_entropy_with_logits(logit, target)
+
+
+def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
+    """
+    Sets the verifier's logit bias so the TRAIN split's honest and sneaky
+    rows sit symmetrically around the 0.5 threshold: bias = -(median raw
+    logit of honest rows + median raw logit of sneaky rows) / 2, on a fixed
+    balanced subsample of _DATASET_EXAMPLES. Never looks at the spot set or
+    the held-out split. Returns the train-subsample accuracy/accept rate at
+    the new bias, for logging.
+    """
+    if not cfg.verifier_calibrate_bias or not _DATASET_EXAMPLES:
+        return None
+    v = _get_verifier(cfg.verifier_model, cfg)
+    rng = random.Random(cfg.seed)
+    honest = [e for e in _DATASET_EXAMPLES if e["label"] == ANSWER_SOUND]
+    sneaky = [e for e in _DATASET_EXAMPLES if e["label"] != ANSWER_SOUND]
+    rng.shuffle(honest)
+    rng.shuffle(sneaky)
+    k = max(1, cfg.verifier_calibration_rows // 2)
+    honest, sneaky = honest[:k], sneaky[:k]
+    if not honest or not sneaky:
+        return None
+
+    def raw_logits(examples):
+        out = []
+        v["model"].eval()
+        with torch.no_grad():
+            for ex in examples:
+                rec = ex["record"]
+                prompt = _render_verifier_prompt(ex["summary"], rec.get("metrics", {}), rec.get("config", {}), v["tokenizer"])
+                out.append(verifier_logit(v, prompt, apply_bias=False).item())
+        return out
+
+    lh, ls = raw_logits(honest), raw_logits(sneaky)
+    med = lambda xs: sorted(xs)[len(xs) // 2]
+    bias = -(med(lh) + med(ls)) / 2.0
+    v["logit_bias"] = float(bias)
+    preds = [x + bias >= 0 for x in lh] + [x + bias >= 0 for x in ls]
+    labels = [True] * len(lh) + [False] * len(ls)
+    acc = sum(p == l for p, l in zip(preds, labels)) / len(preds)
+    accept = sum(preds) / len(preds)
+    print(f"  [calibration{(' ' + tag) if tag else ''}] logit_bias={bias:+.3f} "
+          f"(train medians honest={med(lh):+.2f} sneaky={med(ls):+.2f}) "
+          f"train-subsample accuracy={acc:.3f} accept_rate={accept:.3f} n={len(preds)}")
+    return {"logit_bias": bias, "train_accuracy": acc, "train_accept_rate": accept, "n": len(preds)}
 
 
 def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int = 1, tag: str = "") -> dict:
@@ -489,7 +550,9 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
     mean_loss = total / max(count, 1)
     print(f"  [verifier update{(' ' + tag) if tag else ''}] mean_bce={mean_loss:.4f} "
           f"on {len(examples)} examples x {epochs} epoch(s)")
-    return {"examples": len(examples), "epochs": epochs, "loss": mean_loss}
+    calibrate_verifier_bias(cfg, tag=tag)
+    return {"examples": len(examples), "epochs": epochs, "loss": mean_loss,
+            "logit_bias": _VERIFIER_CACHE[cfg.verifier_model].get("logit_bias", 0.0)}
 
 
 def train_verifier_on_round(helpful_findings: List[dict], sneaky_findings: List[dict], cfg: PVGConfig) -> dict:
@@ -610,6 +673,7 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
         spot_check_accept_rate=spot["accept_rate"] if spot else None,
         verifier_train_examples=vstats["examples"],
         verifier_train_loss=vstats["loss"],
+        verifier_logit_bias=vstats.get("logit_bias"),
     )
 
     reasons = []

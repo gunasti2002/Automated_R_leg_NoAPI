@@ -33,6 +33,13 @@ reward > helpful reward) were noise and have been discarded.
   held-out split). **Runs**: `run_experiment.py --seeds 42 43 44 --rounds 10`,
   curves via `eval/plot_rounds.py`. Notebook: `notebooks/Experiments_v2.ipynb`.
 
+**24 Sep, first Colab run.** The gate refused: after warm-up the verifier
+ranked the spot set at AUROC 0.86 but accepted only 25-30% of it (threshold
+drift). Now: a scalar logit bias is calibrated on the train split after every
+verifier update and saved with the checkpoint; the verifier LoRA covers all
+linear layers; a third of synthetic records are sparse (pgr / se / seeds
+only) like the real findings and the spot-check cases.
+
 **Run order.**
 ```
 python data/build_findings_dataset.py --target-pairs 120 --seed 42

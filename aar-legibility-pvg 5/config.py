@@ -65,6 +65,18 @@ class PVGConfig:
     verifier_batch_size: int = 16
     verifier_lora_r: int = 16
     verifier_lora_alpha: int = 16
+    # q/v-only LoRA left the warm-up underfit (BCE 0.44 after 6 epochs on
+    # 192 rows); all linear layers fit far faster for negligible memory.
+    verifier_lora_targets: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj",
+                                              "gate_proj", "up_proj", "down_proj")
+    # After every verifier update, shift the SOUND/UNSOUND logit by a scalar
+    # bias so the TRAIN split's honest and sneaky rows sit symmetrically
+    # around the 0.5 threshold (midpoint of the two class medians). The
+    # first Colab warm-up ranked the spot set at AUROC 0.86 but accepted only
+    # 25% of it — a threshold drift, not a discrimination failure. The bias
+    # is saved with the checkpoint and never fitted on the spot/held-out sets.
+    verifier_calibrate_bias: bool = True
+    verifier_calibration_rows: int = 96   # balanced subsample of the train split scored per calibration
     # Before round 1 the verifier does N epochs on the TRAIN split of the
     # labeled dataset, so round-1 provers see a non-degenerate reward.
     verifier_warmup_epochs: int = 2
@@ -148,6 +160,7 @@ class RunMetadata:
     spot_check_accept_rate: Optional[float] = None
     verifier_train_examples: Optional[int] = None
     verifier_train_loss: Optional[float] = None
+    verifier_logit_bias: Optional[float] = None    # calibration offset in force for this round
     aborted: bool = False
     elapsed_s: Optional[float] = None
     human_eval_helpful_accuracy: Optional[float] = None
