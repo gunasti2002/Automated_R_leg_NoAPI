@@ -28,6 +28,10 @@ def looks_like_refusal(text: str) -> bool:
     return (not t) or any(m in t[:200] for m in _REFUSAL_MARKERS)
 
 
+class BlockedError(RuntimeError):
+    """The provider refused this one request (HTTP 403 / content filter)."""
+
+
 class APIProver:
     def __init__(self, cfg: PVGConfig, cache_dir):
         self.cfg = cfg
@@ -42,9 +46,9 @@ class APIProver:
                       "cost_usd": 0.0, "errors": 0, "refusals": 0}
 
     # -- one raw call ------------------------------------------------------
-    def _call(self, prompt_text: str, temperature: float, max_tokens: int) -> dict:
+    def _call(self, prompt_text: str, temperature: float, max_tokens: int, model: Optional[str] = None) -> dict:
         body = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": [{"role": "system", "content": self.cfg.prover_api_system},
                          {"role": "user", "content": prompt_text}],
             "temperature": temperature,
@@ -69,7 +73,9 @@ class APIProver:
                 return out
             except urllib.error.HTTPError as e:
                 last_err = f"HTTP {e.code}: {e.read().decode()[:300]}"
-                if e.code in (400, 401, 402, 403, 404):
+                if e.code == 403:
+                    raise BlockedError(last_err)
+                if e.code in (400, 401, 402, 404):
                     break
             except Exception as e:  # network / 5xx / parse
                 last_err = repr(e)
@@ -90,29 +96,54 @@ class APIProver:
             return json.loads(path.read_text())["completions"]
         completions = []
         for i in range(n):
-            text, finish = "", None
-            for budget in (max_tokens, max_tokens * 2):   # one retry if reasoning ate the whole budget
-                out = self._call(prompt_text, temperature, budget)
-                choice = out["choices"][0]
-                text = (choice["message"].get("content") or "").strip()
-                finish = choice.get("finish_reason")
-                u = out.get("usage") or {}
-                self.usage["calls"] += 1
-                self.usage["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
-                self.usage["completion_tokens"] += int(u.get("completion_tokens") or 0)
-                self.usage["cost_usd"] += float(u.get("cost") or 0.0)
-                served = out.get("model")
-                if served:
-                    self.usage.setdefault("served_models", {})
-                    self.usage["served_models"][served] = self.usage["served_models"].get(served, 0) + 1
-                if text or finish != "length":
-                    break
-            if finish in ("content_filter", "refusal") or looks_like_refusal(text):
-                self.usage["refusals"] += 1
-            completions.append(text)
+            completions.append(self._one_sample(prompt_text, temperature, max_tokens))
         path.write_text(json.dumps({"model": self.model, "cache_key": cache_key, "prompt": prompt_text,
                                     "completions": completions}))
         return completions
+
+    def _generate(self, prompt_text, temperature, max_tokens, model):
+        text, finish = "", None
+        for budget in (max_tokens, max_tokens * 2):   # one retry if reasoning ate the whole budget
+            out = self._call(prompt_text, temperature, budget, model)
+            choice = out["choices"][0]
+            text = (choice["message"].get("content") or "").strip()
+            finish = choice.get("finish_reason")
+            u = out.get("usage") or {}
+            self.usage["calls"] += 1
+            self.usage["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
+            self.usage["completion_tokens"] += int(u.get("completion_tokens") or 0)
+            self.usage["cost_usd"] += float(u.get("cost") or 0.0)
+            served = out.get("model")
+            if served:
+                self.usage.setdefault("served_models", {})
+                self.usage["served_models"][served] = self.usage["served_models"].get(served, 0) + 1
+            if text or finish != "length":
+                break
+        if finish in ("content_filter", "refusal") or looks_like_refusal(text):
+            raise BlockedError(f"declined in text / finish={finish}")
+        return text
+
+    def _one_sample(self, prompt_text, temperature, max_tokens) -> Optional[str]:
+        """One completion, or None if the primary and the fallback both refuse."""
+        for k in ("blocked", "fallback_used", "skipped"):
+            self.usage.setdefault(k, 0)
+        for attempt in range(1 + max(0, self.cfg.prover_api_block_retries)):
+            try:
+                return self._generate(prompt_text, temperature, max_tokens, self.model)
+            except BlockedError:
+                self.usage["blocked"] += 1
+                time.sleep(1.5 * (attempt + 1))
+        fb = self.cfg.prover_api_fallback_model
+        if fb and fb != self.model:
+            try:
+                text = self._generate(prompt_text, temperature, max_tokens, fb)
+                self.usage["fallback_used"] += 1
+                return text
+            except BlockedError:
+                self.usage["blocked"] += 1
+        self.usage["skipped"] += 1
+        self.usage["refusals"] += 1
+        return None
 
     def save_usage(self, path) -> None:
         Path(path).write_text(json.dumps(self.usage, indent=2))

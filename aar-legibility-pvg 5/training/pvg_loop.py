@@ -688,6 +688,8 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
                     item["prompt"], n=cfg.prover_num_generations, temperature=cfg.prover_temperature,
                     cache_key=f"seed{seed}-round{round_num}-{role}-{rid}")
                 for c in comps:
+                    if not c:   # blocked/refused by the provider and the fallback: skip, counted in api_usage
+                        continue
                     r = float(reward_fn(c, item["record"]))
                     rewards.append(r)
                     samples.append({"prompt": item["prompt"], "record": item["record"], "completion": c, "reward": r})
@@ -697,7 +699,10 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
         u = helpful_prover_state.usage
         print(f"  [api prover {helpful_prover_state.model}] helpful mean_reward={helpful_stats['mean_reward']:.3f} "
               f"sneaky mean_reward={sneaky_stats['mean_reward']:.3f}  calls={u['calls']} cache_hits={u['cache_hits']} "
-              f"refusals={u['refusals']} cost=${u['cost_usd']:.3f}")
+              f"blocked={u.get('blocked', 0)} fallback={u.get('fallback_used', 0)} skipped={u.get('skipped', 0)} "
+              f"cost=${u['cost_usd']:.3f}")
+        if not helpful_stats["samples"] or not sneaky_stats["samples"]:
+            raise RuntimeError("every sample of one role was blocked/refused this round; see api_usage.json")
     else:
         helpful_stats = train_prover_role(helpful_prover_state, helpful_prompts, helpful_reward, cfg)
         sneaky_stats = train_prover_role(sneaky_prover_state, sneaky_prompts, sneaky_reward, cfg)

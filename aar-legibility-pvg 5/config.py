@@ -32,6 +32,12 @@ class PVGConfig:
     prover_api_key_env: str = "OPENROUTER_API_KEY"
     prover_api_max_tokens: int = 1200          # includes the model's reasoning tokens
     prover_api_reasoning_effort: str = "low"   # OpenRouter unified `reasoning.effort`; "" to omit
+    # Anthropic intermittently blocks individual sneaky-role requests (HTTP 403
+    # "Request not allowed") or the model declines in text. Such a sample is
+    # retried, then tried once on this fallback model, then skipped and counted
+    # (api_usage.json: blocked / fallback_used / skipped). "" disables the fallback.
+    prover_api_fallback_model: str = "anthropic/claude-sonnet-5"
+    prover_api_block_retries: int = 2
     # Same length band for both roles: in a 16-sample check Claude's honest
     # write-ups averaged 226 words and its sneaky ones 146, a shortcut a small
     # verifier could learn instead of checking the numbers.
