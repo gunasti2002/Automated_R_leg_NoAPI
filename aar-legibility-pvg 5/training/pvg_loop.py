@@ -462,12 +462,29 @@ def add_to_replay(examples: List[dict], cfg: PVGConfig) -> None:
         del _REPLAY_BUFFER[: len(_REPLAY_BUFFER) - cfg.verifier_replay_max]
 
 
-def _verifier_example_loss(v: dict, ex: dict) -> torch.Tensor:
+def _verifier_example_loss(v: dict, ex: dict, weight: float = 1.0) -> torch.Tensor:
     record = ex["record"]
     prompt = _render_verifier_prompt(ex["summary"], record.get("metrics", {}), record.get("config", {}), v["tokenizer"])
     logit = verifier_logit(v, prompt).unsqueeze(0)
     target = torch.tensor([1.0 if ex["label"] == ANSWER_SOUND else 0.0], device=logit.device)
-    return F.binary_cross_entropy_with_logits(logit, target)
+    return weight * F.binary_cross_entropy_with_logits(logit, target)
+
+
+# Class balancing. Relabeling rule-check failures leaves the prover-sample
+# pool ~85-90% UNSOUND; unweighted BCE then teaches "everything is UNSOUND"
+# (raw logit medians drifted to honest=-3.9 / sneaky=-23.6, hidden by a
+# +13.7 calibration bias). Weight each class so it carries half the loss,
+# capped so a handful of SOUND samples cannot dominate.
+VERIFIER_CLASS_WEIGHT_CAP = 5.0
+
+
+def class_weights(examples: List[dict], cap: float = VERIFIER_CLASS_WEIGHT_CAP) -> Tuple[float, float, int, int]:
+    n = len(examples)
+    n_pos = sum(1 for e in examples if e["label"] == ANSWER_SOUND)
+    n_neg = n - n_pos
+    w_pos = min(n / (2 * n_pos), cap) if n_pos else 1.0
+    w_neg = min(n / (2 * n_neg), cap) if n_neg else 1.0
+    return w_pos, w_neg, n_pos, n_neg
 
 
 def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
@@ -483,8 +500,12 @@ def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
         return None
     v = _get_verifier(cfg.verifier_model, cfg)
     rng = random.Random(cfg.seed)
-    honest = [e for e in _DATASET_EXAMPLES if e["label"] == ANSWER_SOUND]
-    sneaky = [e for e in _DATASET_EXAMPLES if e["label"] != ANSWER_SOUND]
+    # Calibrate on the labeled train split PLUS recent prover samples, so the
+    # threshold is set for the text the verifier actually scores in the game
+    # (not only the templated dataset rows). Still never touches spot/held-out.
+    pool = list(_DATASET_EXAMPLES) + list(_REPLAY_BUFFER[-128:])
+    honest = [e for e in pool if e["label"] == ANSWER_SOUND]
+    sneaky = [e for e in pool if e["label"] != ANSWER_SOUND]
     rng.shuffle(honest)
     rng.shuffle(sneaky)
     k = max(1, cfg.verifier_calibration_rows // 2)
@@ -528,6 +549,10 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
     if not examples:
         return {"examples": 0, "epochs": epochs, "loss": None}
 
+    w_pos, w_neg, n_pos, n_neg = class_weights(examples)
+    print(f"  [verifier balance{(' ' + tag) if tag else ''}] SOUND={n_pos} UNSOUND={n_neg} "
+          f"w_pos={w_pos:.2f} w_neg={w_neg:.2f}")
+
     model.train()
     bs = max(1, int(cfg.verifier_batch_size))
     total, count = 0.0, 0
@@ -538,7 +563,8 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
             chunk = order[start:start + bs]
             optimizer.zero_grad(set_to_none=True)
             for ex in chunk:
-                loss = _verifier_example_loss(v, ex) / len(chunk)
+                w = w_pos if ex["label"] == ANSWER_SOUND else w_neg
+                loss = _verifier_example_loss(v, ex, w) / len(chunk)
                 loss.backward()
                 total += loss.item() * len(chunk)
                 count += 1
@@ -557,14 +583,37 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
 
 def train_verifier_on_round(helpful_findings: List[dict], sneaky_findings: List[dict], cfg: PVGConfig) -> dict:
     """Adds this round's prover samples to the replay window and trains on
-    labeled dataset + replay."""
-    new_examples = (
-        [make_verifier_example(it["summary"], it["record"], True, "helpful") for it in helpful_findings] +
-        [make_verifier_example(it["summary"], it["record"], False, "sneaky") for it in sneaky_findings]
-    )
+    labeled dataset + replay.
+
+    Labels come from the rule check, not the prover's role:
+      - helpful sample that FAILS the rule check -> relabeled UNSOUND
+      - sneaky sample that PASSES the rule check -> dropped (its ground truth
+        is unknown; it may be honest by accident or a true-numbers attack)
+    Class balancing happens afterwards, in train_verifier_on_examples, so it
+    sees the final labels.
+    """
+    new_examples: List[dict] = []
+    relabeled_helpful, dropped_sneaky = 0, 0
+    for it in helpful_findings:
+        ok = rule_check_passes(it["record"], it["summary"])
+        if not ok:
+            relabeled_helpful += 1
+        new_examples.append(make_verifier_example(it["summary"], it["record"], ok,
+                                                  "helpful" if ok else "helpful_relabeled"))
+    for it in sneaky_findings:
+        if rule_check_passes(it["record"], it["summary"]):
+            dropped_sneaky += 1
+            continue
+        new_examples.append(make_verifier_example(it["summary"], it["record"], False, "sneaky"))
+    print(f"  [verifier labels] kept={len(new_examples) - relabeled_helpful} "
+          f"relabeled_helpful->UNSOUND={relabeled_helpful} dropped_sneaky(passes rule check)={dropped_sneaky}")
+
     add_to_replay(new_examples, cfg)
     examples = (list(_DATASET_EXAMPLES) if cfg.verifier_train_on_dataset else []) + list(_REPLAY_BUFFER)
-    return train_verifier_on_examples(examples, cfg, epochs=cfg.verifier_train_epochs_per_round, tag="round")
+    stats = train_verifier_on_examples(examples, cfg, epochs=cfg.verifier_train_epochs_per_round, tag="round")
+    stats["relabeled_helpful"] = relabeled_helpful
+    stats["dropped_sneaky"] = dropped_sneaky
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +724,11 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
         verifier_train_loss=vstats["loss"],
         verifier_logit_bias=vstats.get("logit_bias"),
     )
+    # Set as attributes (not constructor kwargs) so this works whether or not
+    # your config.py's RunMetadata declares these fields; vars() still logs them.
+    metadata.spot_check_auroc = spot["auroc"] if spot else None
+    metadata.verifier_relabeled_helpful = vstats.get("relabeled_helpful")
+    metadata.verifier_dropped_sneaky = vstats.get("dropped_sneaky")
 
     reasons = []
     if heldout and heldout["accept_rate"] > cfg.abort_if_heldout_accept_rate_above:
