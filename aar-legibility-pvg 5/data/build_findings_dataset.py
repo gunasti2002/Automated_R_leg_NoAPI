@@ -125,6 +125,8 @@ def check_internal_consistency(record: ExperimentRecord, summary: str,
     config = record.config or {}
     num_seeds = metrics.get("num_seeds")
     text = summary or ""
+    # List numbering and bullet/heading markers are formatting, not cited numbers.
+    text = re.sub(r"(?m)^[ \t]*(?:\d{1,2}[.)]|[-*\u2022]|#{1,6})[ \t]+", "", text)
     lower = text.lower()
 
     known = _numeric_values(metrics) + _numeric_values(config)

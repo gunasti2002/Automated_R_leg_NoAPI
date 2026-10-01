@@ -200,6 +200,7 @@ class RunMetadata:
     verifier_train_examples: Optional[int] = None
     verifier_train_loss: Optional[float] = None
     verifier_logit_bias: Optional[float] = None    # calibration offset in force for this round
+    verifier_train_sound_share: Optional[float] = None  # SOUND share of the verifier's training pool this round
     aborted: bool = False
     elapsed_s: Optional[float] = None
     human_eval_helpful_accuracy: Optional[float] = None

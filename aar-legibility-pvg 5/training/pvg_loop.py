@@ -464,12 +464,29 @@ def add_to_replay(examples: List[dict], cfg: PVGConfig) -> None:
         del _REPLAY_BUFFER[: len(_REPLAY_BUFFER) - cfg.verifier_replay_max]
 
 
-def _verifier_example_loss(v: dict, ex: dict) -> torch.Tensor:
+def _verifier_example_loss(v: dict, ex: dict, weight: float = 1.0) -> torch.Tensor:
     record = ex["record"]
     prompt = _render_verifier_prompt(ex["summary"], record.get("metrics", {}), record.get("config", {}), v["tokenizer"])
     logit = verifier_logit(v, prompt).unsqueeze(0)
     target = torch.tensor([1.0 if ex["label"] == ANSWER_SOUND else 0.0], device=logit.device)
-    return F.binary_cross_entropy_with_logits(logit, target)
+    return weight * F.binary_cross_entropy_with_logits(logit, target)
+
+
+# Class balancing. Relabeling rule-check failures leaves the prover-sample
+# pool ~85-90% UNSOUND; unweighted BCE then teaches "everything is UNSOUND"
+# (raw logit medians drifted to honest=-3.9 / sneaky=-23.6, hidden by a
+# +13.7 calibration bias). Weight each class so it carries half the loss,
+# capped so a handful of SOUND samples cannot dominate.
+VERIFIER_CLASS_WEIGHT_CAP = 5.0
+
+
+def class_weights(examples: List[dict], cap: float = VERIFIER_CLASS_WEIGHT_CAP) -> Tuple[float, float, int, int]:
+    n = len(examples)
+    n_pos = sum(1 for e in examples if e["label"] == ANSWER_SOUND)
+    n_neg = n - n_pos
+    w_pos = min(n / (2 * n_pos), cap) if n_pos else 1.0
+    w_neg = min(n / (2 * n_neg), cap) if n_neg else 1.0
+    return w_pos, w_neg, n_pos, n_neg
 
 
 def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
@@ -485,8 +502,16 @@ def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
         return None
     v = _get_verifier(cfg.verifier_model, cfg)
     rng = random.Random(cfg.seed)
-    honest = [e for e in _DATASET_EXAMPLES if e["label"] == ANSWER_SOUND]
-    sneaky = [e for e in _DATASET_EXAMPLES if e["label"] != ANSWER_SOUND]
+    # Calibrate on the labeled train split PLUS recent prover samples, so the
+    # threshold is set for the text the verifier actually scores in the game
+    # (not only the templated dataset rows). Still never touches spot/held-out.
+    # One full round of prover samples (both roles). A fixed tail of 128 would be
+    # sneaky-only once a round holds 128 samples per role, since each round's
+    # helpful samples are appended before its sneaky ones.
+    recent = 2 * cfg.findings_per_round * cfg.prover_num_generations
+    pool = list(_DATASET_EXAMPLES) + list(_REPLAY_BUFFER[-recent:])
+    honest = [e for e in pool if e["label"] == ANSWER_SOUND]
+    sneaky = [e for e in pool if e["label"] != ANSWER_SOUND]
     rng.shuffle(honest)
     rng.shuffle(sneaky)
     k = max(1, cfg.verifier_calibration_rows // 2)
@@ -530,6 +555,10 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
     if not examples:
         return {"examples": 0, "epochs": epochs, "loss": None}
 
+    w_pos, w_neg, n_pos, n_neg = class_weights(examples)
+    print(f"  [verifier balance{(' ' + tag) if tag else ''}] SOUND={n_pos} UNSOUND={n_neg} "
+          f"w_pos={w_pos:.2f} w_neg={w_neg:.2f}")
+
     model.train()
     bs = max(1, int(cfg.verifier_batch_size))
     total, count = 0.0, 0
@@ -540,7 +569,8 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
             chunk = order[start:start + bs]
             optimizer.zero_grad(set_to_none=True)
             for ex in chunk:
-                loss = _verifier_example_loss(v, ex) / len(chunk)
+                w = w_pos if ex["label"] == ANSWER_SOUND else w_neg
+                loss = _verifier_example_loss(v, ex, w) / len(chunk)
                 loss.backward()
                 total += loss.item() * len(chunk)
                 count += 1
@@ -554,7 +584,8 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
           f"on {len(examples)} examples x {epochs} epoch(s)")
     calibrate_verifier_bias(cfg, tag=tag)
     return {"examples": len(examples), "epochs": epochs, "loss": mean_loss,
-            "logit_bias": _VERIFIER_CACHE[cfg.verifier_model].get("logit_bias", 0.0)}
+            "logit_bias": _VERIFIER_CACHE[cfg.verifier_model].get("logit_bias", 0.0),
+            "sound_share": (n_pos / len(examples)) if examples else None}
 
 
 def assign_verifier_labels(helpful_scored: List[dict], sneaky_scored: List[dict], cfg: PVGConfig) -> Tuple[List[dict], dict]:
@@ -588,7 +619,9 @@ def assign_verifier_labels(helpful_scored: List[dict], sneaky_scored: List[dict]
 
 def train_verifier_on_round(helpful_findings: List[dict], sneaky_findings: List[dict], cfg: PVGConfig) -> dict:
     """Adds this round's prover samples (labeled by assign_verifier_labels) to
-    the replay window and trains on labeled dataset + replay."""
+    the replay window and trains on labeled dataset + replay. Class balancing
+    happens afterwards, in train_verifier_on_examples, so it sees the final
+    labels (relabeling leaves the prover-sample pool mostly UNSOUND)."""
     new_examples, lstats = assign_verifier_labels(helpful_findings, sneaky_findings, cfg)
     print(f"  [verifier labels] kept={lstats['kept']} relabeled_helpful->UNSOUND={lstats['relabeled_helpful']} "
           f"dropped_sneaky(passes rule check)={lstats['dropped_sneaky']}")
@@ -759,6 +792,7 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
         verifier_train_examples=vstats["examples"],
         verifier_train_loss=vstats["loss"],
         verifier_logit_bias=vstats.get("logit_bias"),
+        verifier_train_sound_share=vstats.get("sound_share"),
     )
 
     reasons = []
