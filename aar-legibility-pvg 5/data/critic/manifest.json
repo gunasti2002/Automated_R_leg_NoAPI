@@ -1,0 +1,49 @@
+{
+  "seed": 42,
+  "counts": {
+    "template": 240,
+    "hand": 20
+  },
+  "n_train": 179,
+  "n_heldout": 81,
+  "train": {
+    "template": {
+      "clean": 96,
+      "flawed": 83,
+      "kinds": {
+        "wrong_number": 42,
+        "omission": 15,
+        "overclaim": 17,
+        "misleading_framing": 6,
+        "false_comparison": 3
+      }
+    }
+  },
+  "heldout": {
+    "template": {
+      "clean": 24,
+      "flawed": 37,
+      "kinds": {
+        "misattributed_metric": 15,
+        "wrong_number": 12,
+        "overclaim": 5,
+        "omission": 4,
+        "misleading_framing": 1
+      }
+    },
+    "hand": {
+      "clean": 10,
+      "flawed": 10,
+      "kinds": {
+        "wrong_number": 4,
+        "false_comparison": 1,
+        "misattributed_metric": 2,
+        "overclaim": 2,
+        "omission": 1
+      }
+    }
+  },
+  "holdout_type": "misattributed_metric (all such items are in heldout)",
+  "flawed_items_evading_rule_check": 39,
+  "flawed_items_total": 130
+}
