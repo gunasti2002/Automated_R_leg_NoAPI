@@ -32,6 +32,8 @@ MAX_QUOTE_SHARE = 0.6        # a quote may cover at most this share of the findi
 MIN_QUOTE_CAP_CHARS = 140    # ... unless the finding is short
 ANY_QUOTE_RE = re.compile(r'[“"]([^"”]{8,}?)[”"]')
 METRIC_RE = re.compile(r"METRIC:\s*([a-z_]+)", re.I)
+OBJECTION_RE = re.compile(r'QUOTE:\s*[“"]([^"”]{2,}?)[”"]\s*METRIC:\s*([A-Za-z_/]+)', re.I)
+MIN_PINPOINT_WORDS = 4
 NO_ISSUES_RE = re.compile(r"^\s*NO ISSUES?\.?\s*$", re.I | re.M)
 
 
@@ -41,19 +43,36 @@ def _norm(s: str) -> str:
     return s.strip(" .,;:\"'")
 
 
-def _span_positions(finding_n: str, span: str) -> Tuple[int, int]:
-    sn = _norm(span)
+def _collapse(s: str) -> str:
+    """Same character mapping as _norm but without trimming, so prefix lengths map offsets."""
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def _flaw_positions(finding: str, finding_n: str, flaw: dict) -> Tuple[int, int]:
+    """Where the flaw sits in the normalized finding: from its recorded character
+    offsets when present (a value like 0.85 can occur twice), else by search."""
+    cs, ce = flaw.get("char_start", -1), flaw.get("char_end", -1)
+    if isinstance(cs, int) and cs >= 0 and finding[cs:ce] == flaw["span"]:
+        lead = len(finding) - len(finding.lstrip())
+        a = len(_collapse(finding[lead:cs])) if cs >= lead else 0
+        b = a + len(_collapse(flaw["span"]).strip())
+        return a, b
+    sn = _norm(flaw["span"])
     pos = finding_n.find(sn)
     return (pos, pos + len(sn)) if pos >= 0 else (-1, -1)
 
 
 def judge_item(item: dict, critique: str) -> dict:
-    finding_n = _norm(item["finding"])
+    finding = item["finding"]
+    finding_n = _collapse(finding).strip()
     flaws = item.get("flaws", [])
     objections = []
-    quotes = QUOTE_RE.findall(critique) or ([] if NO_ISSUES_RE.search(critique or "") else ANY_QUOTE_RE.findall(critique or ""))
-    metrics_named = [m.lower() for m in METRIC_RE.findall(critique or "")]
-    for q in quotes:
+    pairs = [(q, m.lower()) for q, m in OBJECTION_RE.findall(critique or "")]
+    if not pairs:
+        loose = QUOTE_RE.findall(critique or "") or ([] if NO_ISSUES_RE.search(critique or "") else ANY_QUOTE_RE.findall(critique or ""))
+        pairs = [(q, "") for q in loose]
+    for q, q_metric in pairs:
         qn = _norm(q)
         if len(qn) > max(MIN_QUOTE_CAP_CHARS, MAX_QUOTE_SHARE * len(finding_n)):
             objections.append({"quote": q, "result": "unverifiable", "reason": "quote covers most of the finding"})
@@ -68,21 +87,30 @@ def judge_item(item: dict, critique: str) -> dict:
             continue
         hit = None
         for f in flaws:
-            fa, fb = _span_positions(finding_n, f["span"])
+            fa, fb = _flaw_positions(finding, finding_n, f)
             claimed = f.get("claimed")
             tokens = {str(claimed), f"{float(claimed):.2f}", f"{float(claimed):g}"} if claimed is not None else set()
             has_value = any(re.search(r"(?<![\d.])" + re.escape(tk) + r"(?![\d.])", qn) for tk in tokens)
+            flaw_metrics = [x.lower() for x in f.get("metrics", [])]
+            # An omission adds no wrong text to point at. It is caught by a verbatim
+            # quote plus naming a metric the write-up fails to account for.
+            if f.get("kind") == "omission" and q_metric in flaw_metrics:
+                hit = f
+                break
             for qa, qb in occ:
                 inter = max(0, min(qb, fb) - max(qa, fa)) if fa >= 0 else 0
-                # specific enough: the quote covers at least half the flaw span, or names the wrong value
-                if (fa >= 0 and inter >= 0.5 * (fb - fa)) or (claimed is not None and has_value and fa >= 0 and inter > 0):
+                covers_half = fa >= 0 and inter >= 0.5 * (fb - fa)
+                names_value = claimed is not None and has_value and fa >= 0 and inter > 0
+                # a quote lying wholly inside the flawed span pinpoints part of it
+                pinpoint = fa >= 0 and qa >= fa and qb <= fb and len(qn.split()) >= MIN_PINPOINT_WORDS
+                if covers_half or names_value or pinpoint:
                     hit = f
                     break
             if hit:
                 break
         objections.append({"quote": q, "result": "catch" if hit else "false_objection",
                            "flaw_type": hit["type"] if hit else None,
-                           "metric_named": bool(hit and any(m in [x.lower() for x in hit["metrics"]] for m in metrics_named))})
+                           "metric_named": bool(hit and q_metric in [x.lower() for x in hit["metrics"]])})
     results = [o["result"] for o in objections]
     if "catch" in results:
         verdict = "catch"

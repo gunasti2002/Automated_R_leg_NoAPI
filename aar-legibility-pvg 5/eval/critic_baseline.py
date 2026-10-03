@@ -47,8 +47,10 @@ def main() -> int:
     chosen = flawed[: args.n * 2 // 3] + clean[: args.n - args.n * 2 // 3]
     critiques = {}
     for i, it in enumerate(chosen):
-        user = (f"Metrics: {json.dumps(it['record'].get('metrics', {}), sort_keys=True)}\n"
-                f"Config: {json.dumps(it['record'].get('config', {}), sort_keys=True)}\n\nWrite-up:\n{it['finding']}")
+        rec = it["record"]
+        user = (f"Method: {rec.get('idea_name')}\nDataset: {rec.get('dataset')}\n"
+                f"Metrics: {json.dumps(rec.get('metrics', {}), sort_keys=True)}\n"
+                f"Config: {json.dumps(rec.get('config', {}), sort_keys=True)}\n\nWrite-up:\n{it['finding']}")
         critiques[it["id"]] = api_call(CRITIC_SYSTEM, user, cfg, max_tokens=700, temperature=0.0)
         print(f"  {i + 1}/{len(chosen)} cost=${cache_cost():.2f}", flush=True)
     s = score(chosen, critiques)
