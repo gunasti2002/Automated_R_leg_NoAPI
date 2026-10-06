@@ -201,6 +201,8 @@ def render_prover_prompt(template_path: Path, record: dict, tokenizer, cfg: PVGC
         metrics=json.dumps(record.get("metrics", {}) or {}, sort_keys=True),
         config=json.dumps(record.get("config", {}) or {}, sort_keys=True),
     )
+    if tokenizer is None:  # frozen API prover: the prompt IS the user message
+        return text
     if cfg.prover_use_chat_template:
         return tokenizer.apply_chat_template(
             [{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True
@@ -503,7 +505,11 @@ def calibrate_verifier_bias(cfg: PVGConfig, tag: str = "") -> Optional[dict]:
     # Calibrate on the labeled train split PLUS recent prover samples, so the
     # threshold is set for the text the verifier actually scores in the game
     # (not only the templated dataset rows). Still never touches spot/held-out.
-    pool = list(_DATASET_EXAMPLES) + list(_REPLAY_BUFFER[-128:])
+    # One full round of prover samples (both roles). A fixed tail of 128 would be
+    # sneaky-only once a round holds 128 samples per role, since each round's
+    # helpful samples are appended before its sneaky ones.
+    recent = 2 * cfg.findings_per_round * cfg.prover_num_generations
+    pool = list(_DATASET_EXAMPLES) + list(_REPLAY_BUFFER[-recent:])
     honest = [e for e in pool if e["label"] == ANSWER_SOUND]
     sneaky = [e for e in pool if e["label"] != ANSWER_SOUND]
     rng.shuffle(honest)
@@ -578,48 +584,58 @@ def train_verifier_on_examples(examples: List[dict], cfg: PVGConfig, epochs: int
           f"on {len(examples)} examples x {epochs} epoch(s)")
     calibrate_verifier_bias(cfg, tag=tag)
     return {"examples": len(examples), "epochs": epochs, "loss": mean_loss,
-            "logit_bias": _VERIFIER_CACHE[cfg.verifier_model].get("logit_bias", 0.0)}
+            "logit_bias": _VERIFIER_CACHE[cfg.verifier_model].get("logit_bias", 0.0),
+            "sound_share": (n_pos / len(examples)) if examples else None}
+
+
+def assign_verifier_labels(helpful_scored: List[dict], sneaky_scored: List[dict], cfg: PVGConfig) -> Tuple[List[dict], dict]:
+    """
+    Verifier training labels for this round's prover samples. The project's
+    ground truth is internal consistency, so with
+    cfg.verifier_labels_from_rule_check the rule check decides where it can:
+      helpful & passes -> SOUND
+      helpful & fails  -> UNSOUND (relabeled: a wrong number or an unsupported claim)
+      sneaky  & fails  -> UNSOUND
+      sneaky  & passes -> dropped (could be a true-numbers misrepresentation or
+                          plain honest text; the labeled dataset covers that case)
+    Without the flag, role labels are used as before.
+    """
+    examples, relabeled, dropped = [], 0, 0
+    for it in helpful_scored:
+        ok = it.get("rule_ok", True)
+        if cfg.verifier_labels_from_rule_check and not ok:
+            examples.append(make_verifier_example(it["summary"], it["record"], False, "helpful_relabeled"))
+            relabeled += 1
+        else:
+            examples.append(make_verifier_example(it["summary"], it["record"], True, "helpful"))
+    for it in sneaky_scored:
+        ok = it.get("rule_ok", False)
+        if cfg.verifier_labels_from_rule_check and ok:
+            dropped += 1
+            continue
+        examples.append(make_verifier_example(it["summary"], it["record"], False, "sneaky"))
+    return examples, {"relabeled_helpful": relabeled, "dropped_sneaky": dropped, "kept": len(examples)}
 
 
 def train_verifier_on_round(helpful_findings: List[dict], sneaky_findings: List[dict], cfg: PVGConfig) -> dict:
-    """Adds this round's prover samples to the replay window and trains on
-    labeled dataset + replay.
-
-    Labels come from the rule check, not the prover's role:
-      - helpful sample that FAILS the rule check -> relabeled UNSOUND
-      - sneaky sample that PASSES the rule check -> dropped (its ground truth
-        is unknown; it may be honest by accident or a true-numbers attack)
-    Class balancing happens afterwards, in train_verifier_on_examples, so it
-    sees the final labels.
-    """
-    new_examples: List[dict] = []
-    relabeled_helpful, dropped_sneaky = 0, 0
-    for it in helpful_findings:
-        ok = rule_check_passes(it["record"], it["summary"])
-        if not ok:
-            relabeled_helpful += 1
-        new_examples.append(make_verifier_example(it["summary"], it["record"], ok,
-                                                  "helpful" if ok else "helpful_relabeled"))
-    for it in sneaky_findings:
-        if rule_check_passes(it["record"], it["summary"]):
-            dropped_sneaky += 1
-            continue
-        new_examples.append(make_verifier_example(it["summary"], it["record"], False, "sneaky"))
-    print(f"  [verifier labels] kept={len(new_examples) - relabeled_helpful} "
-          f"relabeled_helpful->UNSOUND={relabeled_helpful} dropped_sneaky(passes rule check)={dropped_sneaky}")
-
+    """Adds this round's prover samples (labeled by assign_verifier_labels) to
+    the replay window and trains on labeled dataset + replay. Class balancing
+    happens afterwards, in train_verifier_on_examples, so it sees the final
+    labels (relabeling leaves the prover-sample pool mostly UNSOUND)."""
+    new_examples, lstats = assign_verifier_labels(helpful_findings, sneaky_findings, cfg)
+    print(f"  [verifier labels] kept={lstats['kept']} relabeled_helpful->UNSOUND={lstats['relabeled_helpful']} "
+          f"dropped_sneaky(passes rule check)={lstats['dropped_sneaky']}")
     add_to_replay(new_examples, cfg)
     examples = (list(_DATASET_EXAMPLES) if cfg.verifier_train_on_dataset else []) + list(_REPLAY_BUFFER)
-    stats = train_verifier_on_examples(examples, cfg, epochs=cfg.verifier_train_epochs_per_round, tag="round")
-    stats["relabeled_helpful"] = relabeled_helpful
-    stats["dropped_sneaky"] = dropped_sneaky
-    return stats
+    out = train_verifier_on_examples(examples, cfg, epochs=cfg.verifier_train_epochs_per_round, tag="round")
+    out.update(lstats)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Ground-truth rule check on prover output (role fidelity / CGC reward).
 # ---------------------------------------------------------------------------
-def rule_check_passes(record: dict, summary: str) -> bool:
+def rule_check(record: dict, summary: str) -> Tuple[bool, List[str]]:
     rec = ExperimentRecord(
         idea_name=record.get("idea_name", "unknown"),
         metrics=record.get("metrics", {}) or {},
@@ -628,8 +644,11 @@ def rule_check_passes(record: dict, summary: str) -> bool:
         dataset=record.get("dataset"),
         record_id=record.get("record_id"),
     )
-    ok, _ = check_internal_consistency(rec, summary)
-    return ok
+    return check_internal_consistency(rec, summary)
+
+
+def rule_check_passes(record: dict, summary: str) -> bool:
+    return rule_check(record, summary)[0]
 
 
 def _mean(xs: List[float]) -> float:
@@ -641,21 +660,26 @@ def _mean(xs: List[float]) -> float:
 # ---------------------------------------------------------------------------
 def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_state,
                      sneaky_prover_state, cfg: PVGConfig, heldout_rows: Optional[List[dict]] = None,
-                     spot_rows: Optional[List[dict]] = None, seed: Optional[int] = None) -> RunMetadata:
+                     spot_rows: Optional[List[dict]] = None, seed: Optional[int] = None,
+                     samples_out: Optional[List[dict]] = None) -> RunMetadata:
     """
     One full PVG round. Factored out so run_one_round.py can execute exactly
-    one round, checkpoint, and exit (survivable on Colab).
+    one round, checkpoint, and exit (survivable on Colab). If samples_out is
+    given, every prover sample of the round is appended to it in the format
+    eval/human_eval_harness.py reads ({"experiment", "summary", "label"...}).
     """
     from training.train_prover_step import train_prover_role
 
     print(f"\n=== PVG Round {round_num}/{cfg.num_rounds}" + (f" (seed {seed})" if seed is not None else "") + " ===")
-    if not cfg.use_finetunable_prover:
-        raise NotImplementedError("Frozen API-prover mode is out of scope (no API budget); "
-                                  "set use_finetunable_prover=True.")
     reset_scoring_stats()
+    api_mode = not cfg.use_finetunable_prover
+    if api_mode:
+        from training.api_prover import APIProver
+        assert isinstance(helpful_prover_state, APIProver), \
+            "use_finetunable_prover=False: pass an APIProver as helpful_prover_state"
 
     batch = random.sample(honest_records, min(cfg.findings_per_round, len(honest_records)))
-    tok = helpful_prover_state.tokenizer
+    tok = None if api_mode else helpful_prover_state.tokenizer
     helpful_prompts = [{"prompt": render_prover_prompt(_HELPFUL_PROMPT_PATH, item["experiment"], tok, cfg),
                         "record": item["experiment"]} for item in batch]
     sneaky_prompts = [{"prompt": render_prover_prompt(_SNEAKY_PROMPT_PATH, item["experiment"], tok, cfg),
@@ -664,33 +688,75 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
     def make_reward_fn(role: str):
         raw_scores: List[float] = []
         rule_ok: List[bool] = []
+        rule_issues: List[List[str]] = []
 
         def reward(completion: str, record: dict) -> float:
             p = score_with_verifier(completion, record.get("metrics", {}), record.get("config", {}), cfg.verifier_model)
-            ok = rule_check_passes(record, completion)
+            ok, issues = rule_check(record, completion)
             raw_scores.append(p)
             rule_ok.append(ok)
-            if cfg.prover_reward_mode == "correctness_gated":
+            rule_issues.append(issues)
+            mode = cfg.prover_reward_mode
+            if mode == "convincingness":
+                return p
+            if mode == "helpful_gated":
+                return (p if ok else 0.0) if role == "helpful" else p
+            if mode == "correctness_gated":
                 aligned = ok if role == "helpful" else (not ok)
                 return p if aligned else 0.0
-            return p  # "convincingness": the verifier's P(sound), both roles
-        return reward, raw_scores, rule_ok
+            raise ValueError(f"unknown prover_reward_mode {mode!r}")
+        return reward, raw_scores, rule_ok, rule_issues
 
-    helpful_reward, helpful_raw, helpful_ok = make_reward_fn("helpful")
-    sneaky_reward, sneaky_raw, sneaky_ok = make_reward_fn("sneaky")
+    helpful_reward, helpful_raw, helpful_ok, helpful_issues = make_reward_fn("helpful")
+    sneaky_reward, sneaky_raw, sneaky_ok, sneaky_issues = make_reward_fn("sneaky")
 
-    helpful_stats = train_prover_role(helpful_prover_state, helpful_prompts, helpful_reward, cfg)
-    sneaky_stats = train_prover_role(sneaky_prover_state, sneaky_prompts, sneaky_reward, cfg)
-    print(f"  [prover update] helpful mean_reward={helpful_stats['mean_reward']:.3f} "
-          f"sneaky mean_reward={sneaky_stats['mean_reward']:.3f}")
+    if api_mode:
+        # Frozen prover: sample from Claude, score with the current verifier,
+        # no prover update. Same reward fns, so the metrics below are identical.
+        def sample_role(role, prompts, reward_fn):
+            samples, rewards = [], []
+            for item in prompts:
+                rid = item["record"].get("record_id", "?")
+                comps = helpful_prover_state.complete(
+                    item["prompt"], n=cfg.prover_num_generations, temperature=cfg.prover_temperature,
+                    cache_key=f"seed{seed}-round{round_num}-{role}-{rid}")
+                for c in comps:
+                    if not c:   # blocked/refused by the provider and the fallback: skip, counted in api_usage
+                        continue
+                    r = float(reward_fn(c, item["record"]))
+                    rewards.append(r)
+                    samples.append({"prompt": item["prompt"], "record": item["record"], "completion": c, "reward": r})
+            return {"mean_reward": _mean(rewards), "loss": 0.0, "samples": samples}
+        helpful_stats = sample_role("helpful", helpful_prompts, helpful_reward)
+        sneaky_stats = sample_role("sneaky", sneaky_prompts, sneaky_reward)
+        u = helpful_prover_state.usage
+        print(f"  [api prover {helpful_prover_state.model}] helpful mean_reward={helpful_stats['mean_reward']:.3f} "
+              f"sneaky mean_reward={sneaky_stats['mean_reward']:.3f}  calls={u['calls']} cache_hits={u['cache_hits']} "
+              f"blocked={u.get('blocked', 0)} fallback={u.get('fallback_used', 0)} skipped={u.get('skipped', 0)} "
+              f"cost=${u['cost_usd']:.3f}")
+        if not helpful_stats["samples"] or not sneaky_stats["samples"]:
+            raise RuntimeError("every sample of one role was blocked/refused this round; see api_usage.json")
+    else:
+        helpful_stats = train_prover_role(helpful_prover_state, helpful_prompts, helpful_reward, cfg)
+        sneaky_stats = train_prover_role(sneaky_prover_state, sneaky_prompts, sneaky_reward, cfg)
+        print(f"  [prover update] helpful mean_reward={helpful_stats['mean_reward']:.3f} "
+              f"sneaky mean_reward={sneaky_stats['mean_reward']:.3f}")
 
     # The samples drawn for the GRPO step (scored by the pre-update verifier)
     # double as this round's verifier training data. Re-sampling after the
     # prover step doubled generation time for a negligible policy change.
-    helpful_scored = [{"summary": s["completion"], "score": p, "record": s["record"]}
-                      for s, p in zip(helpful_stats["samples"], helpful_raw)]
-    sneaky_scored = [{"summary": s["completion"], "score": p, "record": s["record"]}
-                     for s, p in zip(sneaky_stats["samples"], sneaky_raw)]
+    helpful_scored = [{"summary": s["completion"], "score": p, "record": s["record"], "rule_ok": ok, "issues": iss}
+                      for s, p, ok, iss in zip(helpful_stats["samples"], helpful_raw, helpful_ok, helpful_issues)]
+    sneaky_scored = [{"summary": s["completion"], "score": p, "record": s["record"], "rule_ok": ok, "issues": iss}
+                     for s, p, ok, iss in zip(sneaky_stats["samples"], sneaky_raw, sneaky_ok, sneaky_issues)]
+    if samples_out is not None:
+        for role, items, rewards in (("helpful", helpful_scored, helpful_stats["samples"]),
+                                     ("sneaky", sneaky_scored, sneaky_stats["samples"])):
+            for it, s in zip(items, rewards):
+                samples_out.append({"round_number": round_num, "seed": seed, "label": role,
+                                    "experiment": it["record"], "summary": it["summary"],
+                                    "verifier_p_sound": it["score"], "reward": s["reward"],
+                                    "rule_check_passes": it["rule_ok"], "consistency_issues": it["issues"]})
 
     reward_gap = _mean(helpful_raw) - _mean(sneaky_raw)
     helpful_acc = compute_helpful_prover_accuracy(helpful_scored)
@@ -720,15 +786,14 @@ def run_single_round(round_num: int, honest_records: List[dict], helpful_prover_
         role_fidelity_sneaky=fidelity_s,
         spot_check_accuracy=spot["accuracy"] if spot else None,
         spot_check_accept_rate=spot["accept_rate"] if spot else None,
+        spot_check_auroc=spot["auroc"] if spot else None,
+        verifier_relabeled_helpful=vstats.get("relabeled_helpful"),
+        verifier_dropped_sneaky=vstats.get("dropped_sneaky"),
         verifier_train_examples=vstats["examples"],
         verifier_train_loss=vstats["loss"],
         verifier_logit_bias=vstats.get("logit_bias"),
+        verifier_train_sound_share=vstats.get("sound_share"),
     )
-    # Set as attributes (not constructor kwargs) so this works whether or not
-    # your config.py's RunMetadata declares these fields; vars() still logs them.
-    metadata.spot_check_auroc = spot["auroc"] if spot else None
-    metadata.verifier_relabeled_helpful = vstats.get("relabeled_helpful")
-    metadata.verifier_dropped_sneaky = vstats.get("dropped_sneaky")
 
     reasons = []
     if heldout and heldout["accept_rate"] > cfg.abort_if_heldout_accept_rate_above:
@@ -801,9 +866,15 @@ def run_pvg_training(dataset_path: str, cfg: PVGConfig, heldout_path: Optional[s
 
     prepare_verifier_for_run(cfg, dataset, spot_rows)
 
-    from training.train_prover_step import load_prover
-    helpful_prover_state = load_prover(cfg, cfg.prover_model)
-    sneaky_prover_state = load_prover(cfg, cfg.prover_model)
+    if cfg.use_finetunable_prover:
+        from training.train_prover_step import load_prover
+        helpful_prover_state = load_prover(cfg, cfg.prover_model)
+        sneaky_prover_state = load_prover(cfg, cfg.prover_model)
+    else:
+        from training.api_prover import APIProver
+        helpful_prover_state = APIProver(cfg, Path("training/api_cache"))
+        sneaky_prover_state = None
+        print(f"Frozen API prover: {cfg.prover_api_model} (only the verifier trains)")
 
     round_history: List[RunMetadata] = []
     for round_num in range(1, cfg.num_rounds + 1):

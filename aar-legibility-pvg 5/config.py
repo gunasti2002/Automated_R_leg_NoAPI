@@ -19,6 +19,31 @@ class PVGConfig:
     #       trained via GRPO against the verifier's score, mirroring
     #       Kirchner et al.'s actual method (see LIMITATIONS.md #7).
     use_finetunable_prover: bool = True
+    # --- Frozen API prover (use_finetunable_prover=False) ---
+    # The real AAR is a frozen Claude model, so this mode is the one that
+    # matches LIMITATIONS.md #5: Claude writes the helpful and sneaky
+    # findings from the same two prompts, its weights never change, and only
+    # the verifier trains. Calls go through OpenRouter's OpenAI-compatible
+    # chat endpoint (the key we have is an OpenRouter key). Completions are
+    # cached on disk under the checkpoint dir, keyed by seed/round/role/
+    # record/index, so a resumed round never re-spends.
+    prover_api_model: str = "anthropic/claude-opus-5"
+    prover_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    prover_api_key_env: str = "OPENROUTER_API_KEY"
+    prover_api_max_tokens: int = 1200          # includes the model's reasoning tokens
+    prover_api_reasoning_effort: str = "low"   # OpenRouter unified `reasoning.effort`; "" to omit
+    # Anthropic intermittently blocks individual sneaky-role requests (HTTP 403
+    # "Request not allowed") or the model declines in text. Such a sample is
+    # retried, then tried once on this fallback model, then skipped and counted
+    # (api_usage.json: blocked / fallback_used / skipped). "" disables the fallback.
+    prover_api_fallback_model: str = "anthropic/claude-sonnet-5"
+    prover_api_block_retries: int = 2
+    # Same length band for both roles: in a 16-sample check Claude's honest
+    # write-ups averaged 226 words and its sneaky ones 146, a shortcut a small
+    # verifier could learn instead of checking the numbers.
+    prover_api_system: str = ("Reply with the finding write-up only: one paragraph of plain prose, "
+                              "between 110 and 160 words, no heading, no preamble, no bullet points, "
+                              "no closing remark.")
     # Small model so a free-tier Colab T4 (16GB) can hold both prover
     # adapters + the verifier at once.
     prover_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -45,12 +70,18 @@ class PVGConfig:
     # with a continuous P(sound) reward). Default is the Dr.GRPO-style
     # unnormalized advantage (r - mean); set True for the classic form.
     grpo_normalize_std: bool = False
-    # "convincingness": reward = verifier P(sound) for both roles (the
-    #     signal the smoke test and rounds 1-4 used).
-    # "correctness_gated": Kirchner et al.'s CGC — reward = P(sound) only when
-    #     the completion is role-aligned per the rule check (helpful must pass
-    #     it, sneaky must fail it), else 0. Opt-in; see the PR notes.
-    prover_reward_mode: str = "convincingness"
+    # Prover reward, with the rule check (data/build_findings_dataset.py's
+    # check_internal_consistency) as the ground-truth oracle:
+    #   "convincingness":    reward = verifier P(sound) for both roles. Round 1
+    #                        on Colab showed the helpful prover passing the rule
+    #                        check only 16% of the time under this reward: it
+    #                        learns to be convincing, not accurate.
+    #   "helpful_gated":     helpful reward = P(sound) if the completion passes
+    #                        the rule check else 0; sneaky reward = P(sound)
+    #                        (free to be subtle). Default.
+    #   "correctness_gated": Kirchner et al.'s CGC — both roles gated (sneaky
+    #                        must FAIL the rule check to earn P(sound)).
+    prover_reward_mode: str = "helpful_gated"
 
     # --- PVG training loop ---
     num_rounds: int = 10                 # outer alternation rounds
@@ -87,6 +118,11 @@ class PVGConfig:
     # Include the labeled TRAIN split in every verifier update (not just
     # the prover-sample replay window). Turn off only for plumbing tests.
     verifier_train_on_dataset: bool = True
+    # Labels for the provers' samples in verifier training come from the rule
+    # check, not the role: helpful & fails -> UNSOUND (relabeled), sneaky &
+    # passes -> dropped (unknown: subtle misrepresentation or plain honest).
+    # Role labels alone fed 64 mostly-wrong 'SOUND' rows per round.
+    verifier_labels_from_rule_check: bool = True
 
     # --- Data construction ---
     source_findings_dir: str = "data/source_findings"
@@ -158,9 +194,13 @@ class RunMetadata:
     role_fidelity_sneaky: Optional[float] = None   # sneaky completions failing the rule check
     spot_check_accuracy: Optional[float] = None    # 20-item hand-checked set
     spot_check_accept_rate: Optional[float] = None
+    spot_check_auroc: Optional[float] = None
+    verifier_relabeled_helpful: Optional[int] = None  # helpful samples relabeled UNSOUND by the rule check
+    verifier_dropped_sneaky: Optional[int] = None     # sneaky samples dropped (passed the rule check)
     verifier_train_examples: Optional[int] = None
     verifier_train_loss: Optional[float] = None
     verifier_logit_bias: Optional[float] = None    # calibration offset in force for this round
+    verifier_train_sound_share: Optional[float] = None  # SOUND share of the verifier's training pool this round
     aborted: bool = False
     elapsed_s: Optional[float] = None
     human_eval_helpful_accuracy: Optional[float] = None
